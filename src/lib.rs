@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
 
 use flate2::Compression;
@@ -99,6 +100,50 @@ pub enum MergeError {
         path: PathBuf,
         #[source]
         source: io::Error,
+    },
+    #[error("failed to read CSV record at {path}:{row}: {source}")]
+    ReadCsvRecord {
+        path: PathBuf,
+        row: usize,
+        #[source]
+        source: csv::Error,
+    },
+    #[error("invalid CSV record at {path}:{row}: expected at least 5 columns, found {columns}")]
+    InvalidCsvRecord {
+        path: PathBuf,
+        row: usize,
+        columns: usize,
+    },
+    #[error("failed to parse `{column}` at {path}:{row}: `{value}` ({source})")]
+    ParseCsvField {
+        path: PathBuf,
+        row: usize,
+        column: &'static str,
+        value: String,
+        #[source]
+        source: ParseIntError,
+    },
+    #[error("invalid metadata span at {path}:{row}: end ({end}) is less than start ({start})")]
+    InvalidCsvSpan {
+        path: PathBuf,
+        row: usize,
+        start: u64,
+        end: u64,
+    },
+    #[error(
+        "overflow while remapping metadata span at {path}:{row}: start={start}, length={length}"
+    )]
+    CsvSpanOverflow {
+        path: PathBuf,
+        row: usize,
+        start: u64,
+        length: u64,
+    },
+    #[error("failed to write CSV record to {path}: {source}")]
+    WriteCsvRecord {
+        path: PathBuf,
+        #[source]
+        source: csv::Error,
     },
 }
 
@@ -362,8 +407,12 @@ fn merge_single_csv_gz_shard(
             source,
         })?;
     let writer = BufWriter::with_capacity(IO_BUFFER_SIZE, output_file);
-    let mut encoder = GzEncoder::new(writer, Compression::default());
-    let mut buffer = vec![0_u8; IO_BUFFER_SIZE];
+    let encoder = GzEncoder::new(writer, Compression::default());
+    let mut csv_writer = csv::WriterBuilder::new()
+        .has_headers(false)
+        .from_writer(encoder);
+    let mut next_start = 0_u64;
+    let mut wrote_header = false;
 
     for input_path in input_paths {
         let input_file = File::open(input_path).map_err(|source| MergeError::OpenSourceFile {
@@ -371,18 +420,98 @@ fn merge_single_csv_gz_shard(
             source,
         })?;
         let reader = BufReader::with_capacity(IO_BUFFER_SIZE, input_file);
-        let mut decoder = MultiGzDecoder::new(reader);
+        let decoder = MultiGzDecoder::new(reader);
+        let mut csv_reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(decoder);
 
-        copy_reader_to_writer(&mut decoder, &mut encoder, &mut buffer).map_err(|source| {
-            MergeError::CopyFileData {
-                source_path: input_path.clone(),
-                destination_path: output_path.to_path_buf(),
+        for (row_index, maybe_record) in csv_reader.records().enumerate() {
+            let row = row_index + 1;
+            let record = maybe_record.map_err(|source| MergeError::ReadCsvRecord {
+                path: input_path.clone(),
+                row,
                 source,
+            })?;
+            if record.is_empty() {
+                continue;
             }
-        })?;
+
+            if is_metadata_header(&record) {
+                if !wrote_header {
+                    csv_writer.write_record(&record).map_err(|source| {
+                        MergeError::WriteCsvRecord {
+                            path: output_path.to_path_buf(),
+                            source,
+                        }
+                    })?;
+                    wrote_header = true;
+                }
+                continue;
+            }
+
+            if record.len() < 5 {
+                return Err(MergeError::InvalidCsvRecord {
+                    path: input_path.clone(),
+                    row,
+                    columns: record.len(),
+                });
+            }
+
+            let start = parse_csv_u64(&record, 0, input_path, row, "start")?;
+            let end = parse_csv_u64(&record, 1, input_path, row, "end")?;
+            if end < start {
+                return Err(MergeError::InvalidCsvSpan {
+                    path: input_path.clone(),
+                    row,
+                    start,
+                    end,
+                });
+            }
+
+            let length = end - start;
+            let new_start = next_start;
+            let new_end =
+                new_start
+                    .checked_add(length)
+                    .ok_or_else(|| MergeError::CsvSpanOverflow {
+                        path: input_path.clone(),
+                        row,
+                        start: new_start,
+                        length,
+                    })?;
+
+            let mut output_record = record
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>();
+            output_record[0] = new_start.to_string();
+            output_record[1] = new_end.to_string();
+
+            csv_writer.write_record(&output_record).map_err(|source| {
+                MergeError::WriteCsvRecord {
+                    path: output_path.to_path_buf(),
+                    source,
+                }
+            })?;
+            next_start = new_end;
+        }
+
         progress.inc(1);
     }
 
+    csv_writer
+        .flush()
+        .map_err(|source| MergeError::WriteCsvRecord {
+            path: output_path.to_path_buf(),
+            source: source.into(),
+        })?;
+    let encoder = csv_writer
+        .into_inner()
+        .map_err(|source| MergeError::WriteCsvRecord {
+            path: output_path.to_path_buf(),
+            source: source.into_error().into(),
+        })?;
     let mut writer = encoder
         .finish()
         .map_err(|source| MergeError::FlushDestinationFile {
@@ -396,6 +525,41 @@ fn merge_single_csv_gz_shard(
             source,
         })?;
     Ok(())
+}
+
+fn parse_csv_u64(
+    record: &csv::StringRecord,
+    index: usize,
+    path: &Path,
+    row: usize,
+    column: &'static str,
+) -> Result<u64, MergeError> {
+    let value = record
+        .get(index)
+        .ok_or_else(|| MergeError::InvalidCsvRecord {
+            path: path.to_path_buf(),
+            row,
+            columns: record.len(),
+        })?;
+    value
+        .parse::<u64>()
+        .map_err(|source| MergeError::ParseCsvField {
+            path: path.to_path_buf(),
+            row,
+            column,
+            value: value.to_string(),
+            source,
+        })
+}
+
+fn is_metadata_header(record: &csv::StringRecord) -> bool {
+    let Some(first) = record.get(0) else {
+        return false;
+    };
+    let Some(second) = record.get(1) else {
+        return false;
+    };
+    first.eq_ignore_ascii_case("start") && second.eq_ignore_ascii_case("end")
 }
 
 fn copy_reader_to_writer<R: Read, W: Write>(
@@ -618,9 +782,12 @@ mod tests {
         let first = inputs.join("a.csv.gz");
         let second = inputs.join("b.csv.gz");
         let third = inputs.join("c.csv.gz");
-        write_gzip(&first, "a,1\n");
-        write_gzip(&second, "b,2\n");
-        write_gzip(&third, "c,3\n");
+        write_gzip(
+            &first,
+            "start,end,id,src,loc\n0,2,id-a,src-a,1\n2,5,id-b,src-a,2\n",
+        );
+        write_gzip(&second, "start,end,id,src,loc\n0,1,id-c,src-b,1\n");
+        write_gzip(&third, "start,end,id,src,loc\n0,4,id-d,src-c,9\n");
 
         let shards = vec![vec![first.clone(), third.clone()], vec![second.clone()]];
         let out0 = outputs.join("00000000.csv.gz");
@@ -630,8 +797,11 @@ mod tests {
         merge_csv_gz_shards(&shards, &[out0.clone(), out1.clone()], &progress)
             .expect("merge csv.gz shards");
 
-        assert_eq!(read_gzip(&out0), "a,1\nc,3\n");
-        assert_eq!(read_gzip(&out1), "b,2\n");
+        assert_eq!(
+            read_gzip(&out0),
+            "start,end,id,src,loc\n0,2,id-a,src-a,1\n2,5,id-b,src-a,2\n5,9,id-d,src-c,9\n"
+        );
+        assert_eq!(read_gzip(&out1), "start,end,id,src,loc\n0,1,id-c,src-b,1\n");
     }
 
     #[test]
@@ -643,8 +813,8 @@ mod tests {
 
         fs::write(input_root.join("a.npy"), [1_u8]).expect("write a.npy");
         fs::write(nested.join("b.npy"), [2_u8]).expect("write b.npy");
-        write_gzip(&input_root.join("a.csv.gz"), "row_a\n");
-        write_gzip(&nested.join("b.csv.gz"), "row_b\n");
+        write_gzip(&input_root.join("a.csv.gz"), "0,1,id-a,src-a,1\n");
+        write_gzip(&nested.join("b.csv.gz"), "0,1,id-b,src-b,1\n");
         fs::write(input_root.join("ignore.bin"), [9_u8]).expect("write ignored file");
 
         let output_path = temp.path().join("sharded");
