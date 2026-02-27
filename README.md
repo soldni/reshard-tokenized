@@ -1,9 +1,5 @@
 <p align="center">
-  <img
-    src="https://github.com/soldni/reshard-tokenized/blob/master/assets/logo.png?raw=true"
-    alt="reshard-tokenized logo"
-    style="max-width: 384px; width: 100%; height: auto;"
-  />
+  <img src="https://github.com/soldni/reshard-tokenized/blob/master/assets/logo.png?raw=true" alt="Library logo" width="384"/>
 </p>
 
 # reshard-tokenized
