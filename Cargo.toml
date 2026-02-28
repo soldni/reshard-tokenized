@@ -1,6 +1,6 @@
 [package]
 name = "reshard-tokenized"
-version = "0.1.0"
+version = "0.2.0"
 description = "CLI for merging tokenized shard .npy files and remapping .csv.gz metadata offsets."
 license = "Apache-2.0"
 repository = "https://github.com/soldni/reshard-tokenized"
